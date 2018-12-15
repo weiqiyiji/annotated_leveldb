@@ -1208,9 +1208,14 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
 
   MutexLock l(&mutex_);
   writers_.push_back(&w);
+
+  // 等待 writer queue 中的前置写操作完成
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
   }
+
+  // 如果本次写操作被队列中的某个前置写操作通过 BuildBatchGroup 合并，
+  // 那么到这里 w.done == true，不需要再进行后续操作
   if (w.done) {
     return w.status;
   }
@@ -1220,6 +1225,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && my_batch != nullptr) {  // nullptr batch is for compactions
+    // updates 是合并后的新 WriteBatch，实际用于本次写操作
     WriteBatch* updates = BuildBatchGroup(&last_writer);
     WriteBatchInternal::SetSequence(updates, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(updates);
@@ -1228,8 +1234,18 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
+    //
+    // 补充一下，为什么在这里可以释放锁。如上面注释所说，接下来写 WAL 和 memtable 的
+    // 的操作，不会有并发，因为其它的 writer 都在前面的
+    // while (!w.done && &w != writers_.front()) {
+    //   w.cv.Wait();
+    // }
+    // 循环这里等待，所以不会有并发写。
+    // 那既然如此，为什么不在 MakeRoomForWrite 的时候就释放锁呢？
+    // 因为 MakeRoomForWrite 和 BackgroundCompaction 有并发冲突
     {
       mutex_.Unlock();
+      // 首先在 WAL 中落地数据
       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
       bool sync_error = false;
       if (status.ok() && options.sync) {
@@ -1239,6 +1255,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
         }
       }
       if (status.ok()) {
+        // 写入到 memtable 中
         status = WriteBatchInternal::InsertInto(updates, mem_);
       }
       mutex_.Lock();
@@ -1273,8 +1290,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   return status;
 }
 
+// 从 writer queue 第一个 writer 开始，合并接下来的 writer，
+// 直到 size 超过了单次 batch write 的 max size
+//
 // REQUIRES: Writer list must be non-empty
 // REQUIRES: First writer must have a non-null batch
+// REQUIRES: mutex_ is held
 WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   mutex_.AssertHeld();
   assert(!writers_.empty());
